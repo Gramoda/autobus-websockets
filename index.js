@@ -2,7 +2,8 @@ import express from "express"
 import {readFile} from "node:fs/promises"
 import path, { dirname, join } from "node:path";
 import url from "node:url"
-import { DateTime } from "luxon";
+import { DateTime, Duration } from "luxon";
+import { WebSocketServer } from "ws";
 
 const port = 3000;
 const timeZone = "Europe/Moscow";
@@ -38,7 +39,13 @@ const getNextDeparture = (firstDepartureTime, frequencyMinutes) => {
   return departure;
 } 
 
-
+const sortBuses = (buses) => {
+  return [...buses].sort((a, b) => {
+    const aDateTime = DateTime.fromISO(`${a.nextDeparture.date}T${a.nextDeparture.time}`);
+    const bDateTime = DateTime.fromISO(`${b.nextDeparture.date}T${b.nextDeparture.time}`);
+    return aDateTime.toMillis() - bDateTime.toMillis();
+  });
+}
 
 const sendUpdatedData = async() => {
   const buses = await loadBuses();
@@ -46,28 +53,81 @@ const sendUpdatedData = async() => {
 
   const updatedBuses = buses.map(bus => {
     const nextDeparture = getNextDeparture(bus.firstDepartureTime, bus.frequencyMinutes);
-    console.log(nextDeparture)
+
+    const now = DateTime.now().setZone(timeZone);
+    
+    const timeRemaning = Duration.fromMillis(nextDeparture.diff(now).toMillis());
+   
+    let time = 0;
+    if (timeRemaning.values.milliseconds < 60000) {
+      time = "Автобус отправляется"
+    } else {
+      time = timeRemaning.toFormat("hh:mm:ss");
+    }
+
+    
     return {...bus, nextDeparture: { 
-      data:nextDeparture.toFormat('yyyy-MM-dd'),
+      date:nextDeparture.toFormat('yyyy-MM-dd'),
       time:nextDeparture.toFormat('HH:mm:ss'),
+      remaning:time,
+      
     }}
   })
 
   return updatedBuses;
 }
 
-
 const app = express();
+
+app.use(express.static(path.join(__dirname,"public")));
+
+
 app.get('/next-departure',async (req,res) => {
   try {
     const updatedData = await sendUpdatedData();
-    res.json(updatedData);
+    const sortedData  = sortBuses(updatedData);
+    console.log(sortedData);
+    res.json(sortedData);
   } catch {
     res.send('error')
   }
 })
 
-app.listen(port , () => {
+const wss = new WebSocketServer({ noServer: true});
+const clients = new Set();
+
+wss.on("connection", (ws) => {
+  console.log('WebSocket connection');
+  clients.add(ws);
+
+  const sendUpdates = async () => {
+    try {
+      const updatedBuses = await sendUpdatedData();
+      const sortedBuses = sortBuses(updatedBuses);
+
+      ws.send(JSON.stringify(sortedBuses));
+    } catch (error){
+      console.log('websocket error ', error);
+    }
+  }
+
+  const intervalId = setInterval(sendUpdates,1000);
+
+
+  ws.on('close', ()=> {
+    clearInterval(intervalId);
+    clients.delete(ws);
+    console.log('Websocket closed')
+  })
+});
+
+const server = app.listen(port , () => {
   console.log('Server running on http://localhost:' + port)
+})
+
+server.on('upgrade', (req,socket, head,) => {
+  wss.handleUpgrade(req,socket, head, (ws) => {
+    wss.emit('connection',ws,req);
+  })
 })
 
